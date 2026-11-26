@@ -1,0 +1,7 @@
+# Oracle lock: changes to these paths need review from Andre (enable
+# "Require review from Code Owners" on main; see docs/BRANCH_PROTECTION.md).
+/tests/                       @andrebyrd-odingard
+/.github/                     @andrebyrd-odingard
+/scripts/attack_baseline.py   @andrebyrd-odingard
+/scripts/metrics.py           @andrebyrd-odingard
+/pytest.ini                   @andrebyrd-odingard
