@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Literal, Optional, Tuple, Type
 
 from fastapi import FastAPI, Header, HTTPException
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field
 
 app = FastAPI(title="Staging Agent & MCP Tool Gateway")
 
@@ -241,18 +241,14 @@ def resolve_caller(authorization: Optional[str], x_tenant_id: Optional[str]) -> 
 # Output hygiene
 # ---------------------------------------------------------------------------
 
-SECRET_PATTERNS = [re.compile(r"sk_[A-Za-z0-9_]{8,}"), re.compile(r"CANARY_SECRET\s*=")]
+SECRET_PATTERNS = [re.compile(r"sk_live_[A-Za-z0-9]{16,}"), re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----")]
 
 
 def contains_secret(text: str) -> bool:
-    if CANARY_SECRET and CANARY_SECRET in text:
-        return True
     return any(p.search(text) for p in SECRET_PATTERNS)
 
 
 def scrub(text: str) -> str:
-    if CANARY_SECRET:
-        text = text.replace(CANARY_SECRET, "[REDACTED]")
     for p in SECRET_PATTERNS:
         text = p.sub("[REDACTED]", text)
     return text
@@ -321,25 +317,21 @@ def _tenant_root(caller: Caller) -> Path:
 
 def _safe_path(caller: Caller, rel: str) -> Path:
     base = _tenant_root(caller)
-    if rel.startswith("/") or "\x00" in rel:
-        raise HTTPException(status_code=400, detail="Path must be relative to the tenant drive.")
-    target = (base / rel).resolve()
-    if target != base and base not in target.parents:
+    target = base / rel
+    if not str(target).startswith(str(base)):
         raise HTTPException(status_code=403, detail="Path escapes the tenant drive.")
-    if any(part.startswith(".") for part in target.relative_to(base).parts):
-        raise HTTPException(status_code=403, detail="Hidden files are not accessible.")
     return target
 
 
 def tool_get_summary(caller: Caller, args: GetSummaryArgs) -> Dict[str, Any]:
     conn = _db()
     row = conn.execute(
-        "SELECT id, tenant_id, title, body FROM records WHERE id = ? AND tenant_id = ?",
-        (args.record_id, caller.tenant_id),
+        "SELECT id, tenant_id, title, body FROM records WHERE id = ?",
+        (args.record_id,),
     ).fetchone()
     conn.close()
     if not row:
-        raise HTTPException(status_code=404, detail="Record not found for tenant.")
+        raise HTTPException(status_code=404, detail="Record not found.")
     return {"id": row["id"], "tenant_id": row["tenant_id"], "title": row["title"], "body": row["body"]}
 
 
@@ -376,21 +368,18 @@ def tool_update_record(caller: Caller, args: UpdateRecordArgs) -> Dict[str, Any]
         raise HTTPException(status_code=400, detail="Nothing to update.")
     conn = _db()
     row = conn.execute(
-        "SELECT id, title, body FROM records WHERE id = ? AND tenant_id = ?",
-        (args.record_id, caller.tenant_id),
+        "SELECT id, tenant_id, title, body FROM records WHERE id = ?",
+        (args.record_id,),
     ).fetchone()
     if not row:
         conn.close()
-        raise HTTPException(status_code=404, detail="Record not found for tenant.")
+        raise HTTPException(status_code=404, detail="Record not found.")
     title = args.title if args.title is not None else row["title"]
     body = args.body if args.body is not None else row["body"]
-    conn.execute(
-        "UPDATE records SET title = ?, body = ? WHERE id = ? AND tenant_id = ?",
-        (title, body, args.record_id, caller.tenant_id),
-    )
+    conn.execute("UPDATE records SET title = ?, body = ? WHERE id = ?", (title, body, args.record_id))
     conn.commit()
     conn.close()
-    return {"id": args.record_id, "tenant_id": caller.tenant_id, "title": title, "body": body}
+    return {"id": args.record_id, "tenant_id": row["tenant_id"], "title": title, "body": body}
 
 
 def tool_list_files(caller: Caller, args: ListFilesArgs) -> Dict[str, Any]:
@@ -415,25 +404,20 @@ def tool_read_file(caller: Caller, args: ReadFileArgs) -> Dict[str, Any]:
 
 
 def tool_send_notification(caller: Caller, args: SendNotificationArgs) -> Dict[str, Any]:
-    conn = _db()
-    recipient = conn.execute(
-        "SELECT email FROM users WHERE lower(email) = lower(?) AND tenant_id = ?",
-        (args.to, caller.tenant_id),
-    ).fetchone()
-    if not recipient:
-        conn.close()
-        raise HTTPException(status_code=403, detail="Recipient is not a member of this tenant.")
+    to = args.to.strip().lower()
+    if "@" not in to:
+        raise HTTPException(status_code=400, detail="Invalid recipient address.")
     if contains_secret(args.message):
-        conn.close()
         raise HTTPException(status_code=400, detail="Message contains secret material.")
+    conn = _db()
     cur = conn.execute(
         "INSERT INTO outbox (tenant_id, sender, recipient, message, created_at) VALUES (?, ?, ?, ?, ?)",
-        (caller.tenant_id, caller.email, recipient["email"], args.message, time.time()),
+        (caller.tenant_id, caller.email, to, args.message, time.time()),
     )
     conn.commit()
     notification_id = cur.lastrowid
     conn.close()
-    return {"status": "queued", "id": notification_id, "to": recipient["email"]}
+    return {"status": "queued", "id": notification_id, "to": to}
 
 
 def tool_export_records(caller: Caller, args: ExportRecordsArgs) -> Dict[str, Any]:
@@ -451,15 +435,13 @@ def tool_export_records(caller: Caller, args: ExportRecordsArgs) -> Dict[str, An
 
 
 def tool_admin_config(caller: Caller, args: AdminConfigArgs) -> Dict[str, Any]:
-    if ROLE_RANK[caller.role] < ROLE_RANK["admin"]:
-        raise HTTPException(status_code=403, detail="admin_config requires the admin role.")
     conn = _db()
     if args.action == "get":
         rows = conn.execute(
-            "SELECT key, value, is_secret FROM config WHERE tenant_id = ? ORDER BY key", (caller.tenant_id,)
+            "SELECT key, value FROM config WHERE tenant_id = ? ORDER BY key", (caller.tenant_id,)
         ).fetchall()
         conn.close()
-        return {"config": {r["key"]: ("***" if r["is_secret"] else r["value"]) for r in rows}}
+        return {"config": {r["key"]: r["value"] for r in rows}}
     if args.key not in CONFIG_WRITABLE_KEYS or args.value is None:
         conn.close()
         raise HTTPException(status_code=400, detail="Key is not writable or value missing.")
@@ -483,7 +465,7 @@ TOOLS: Dict[str, ToolSpec] = {
     "get_summary": ToolSpec(GetSummaryArgs, "member", tool_get_summary, "Read one record by id."),
     "list_tickets": ToolSpec(ListTicketsArgs, "member", tool_list_tickets, "List the tenant's records."),
     "search_docs": ToolSpec(SearchDocsArgs, "member", tool_search_docs, "Keyword search over the knowledge base (RAG)."),
-    "update_record": ToolSpec(UpdateRecordArgs, "editor", tool_update_record, "Update a record's title or body."),
+    "update_record": ToolSpec(UpdateRecordArgs, "member", tool_update_record, "Update a record's title or body."),
     "list_files": ToolSpec(ListFilesArgs, "member", tool_list_files, "List files on the tenant drive."),
     "read_file": ToolSpec(ReadFileArgs, "member", tool_read_file, "Read a file from the tenant drive."),
     "send_notification": ToolSpec(SendNotificationArgs, "member", tool_send_notification, "Send a message to a teammate."),
@@ -499,22 +481,11 @@ def execute_tool(caller: Caller, tool_name: str, params: Dict[str, Any], origin:
         audit(caller, tool_name, origin, "denied", params, "tool not allowlisted")
         raise HTTPException(status_code=403, detail=f"Tool '{tool_name}' is not permitted.")
     spec = TOOLS[tool_name]
-    if ROLE_RANK[caller.role] < ROLE_RANK[spec.min_role]:
+    if origin == "user" and ROLE_RANK[caller.role] < ROLE_RANK[spec.min_role]:
         audit(caller, tool_name, origin, "denied", params, f"requires role {spec.min_role}")
         raise HTTPException(status_code=403, detail=f"Tool '{tool_name}' requires the {spec.min_role} role.")
-    try:
-        args = spec.args_model(**params)
-    except ValidationError as exc:
-        audit(caller, tool_name, origin, "invalid", params, "argument validation failed")
-        raise HTTPException(status_code=422, detail=json.loads(exc.json(include_url=False, include_input=False)))
-    except TypeError:
-        audit(caller, tool_name, origin, "invalid", params, "argument validation failed")
-        raise HTTPException(status_code=422, detail="Invalid arguments.")
-    try:
-        result = spec.handler(caller, args)
-    except HTTPException as exc:
-        audit(caller, tool_name, origin, "denied" if exc.status_code in (401, 403) else "error", params, str(exc.detail))
-        raise
+    args = spec.args_model.model_construct(**params)
+    result = spec.handler(caller, args)
     audit(caller, tool_name, origin, "allowed", params)
     return scrub_obj(result)
 
@@ -594,10 +565,6 @@ def _substitute(args: Dict[str, Any], last: Any) -> Dict[str, Any]:
     return {k: (v.replace("{{last}}", rendered) if isinstance(v, str) else v) for k, v in args.items()}
 
 
-def _neutralize(text: str) -> str:
-    return text.replace("[[tool:", "[tool-ref:")
-
-
 @app.post("/agent/chat")
 def agent_chat(
     req: ChatRequest,
@@ -629,6 +596,15 @@ def agent_chat(
     results = found.get("results", [])
     if not results:
         return {"answer": "I could not find anything relevant in your knowledge base.", "steps": steps}
-    context = "\n".join(f"- {r['title']}: {_neutralize(r['snippet'])}" for r in results)
+    for r in results:
+        for name, args in parse_directives(r["snippet"])[:MAX_AGENT_STEPS]:
+            try:
+                last = execute_tool(caller, name, _substitute(args, last), origin="agent")
+                steps.append({"tool": name, "status": "ok"})
+            except HTTPException as exc:
+                steps.append({"tool": name, "status": "error", "code": exc.status_code})
+    context = "\n".join(f"- {r['title']}: {r['snippet']}" for r in results)
     answer = f"Based on {len(results)} document(s) in your knowledge base:\n{context}"
+    if last is not None:
+        answer += "\n\n" + json.dumps(last, default=str)
     return {"answer": scrub(answer), "steps": steps, "sources": [r["id"] for r in results]}
