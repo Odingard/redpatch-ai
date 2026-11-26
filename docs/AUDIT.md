@@ -84,10 +84,22 @@ Commit `2f10455` (secure gateway + extended oracle) and this PR:
 | 4 | The canary (`sk_canary_test_999`, fake) is seeded as each tenant's `billing_api_key` (flagged secret) and in `DATA_DIR/.env`. Responses, audit rows and outbound messages are scrubbed; the oracle checks responses, the outbox and the audit log. |
 | 5 | 9 tools with per-tool minimum role (member/editor/admin) and Pydantic argument models: `get_summary`, `list_tickets`, `search_docs` (RAG), `update_record`, `list_files`, `read_file`, `send_notification`, `export_records`, `admin_config`. A seeded RAG document carries an injected tool-call payload; retrieved text is never executed as instructions. File tools are confined to the tenant drive; notifications only go to members of the caller's tenant; only non-secret config keys are writable. |
 | 6 | `audit_log` table records every call with request id, authenticated user and tenant, tool, origin (user/agent) and decision (allowed/denied/invalid/error). |
-| 7 | Oracle grows to 45 test cases (31 security, 14 functional), judged from SQLite rows, outbox, config and audit log. |
+| 7 | Oracle grows to 51 test cases (34 security, 17 functional), judged from SQLite rows, outbox, config and audit log. |
 | 8 | Workflow sets `permissions: contents: read` and `timeout-minutes: 10`. |
 | 9 | `.dockerignore` added. Not changed: the container still runs as root (recommend a non-root `USER` once Docker is available to test it). |
-| 10 | Tests and the harness can point at their own `DB_PATH` / `DATA_DIR`; the harness uses a temp dir in-process. |
+| 10 | State persists across restarts by default; reset is opt-in (`REDPATCH_RESET_ON_START=1`, or `init_db(reset=True)` in tests). The oracle and in-process harness always use their own temp `DB_PATH` / `DATA_DIR`. |
+
+## Follow-up fixes from Devin Review on PR #2
+
+| Flag | Fix |
+|---|---|
+| Restart wiped record edits, config, outbox and audit history | `init_db()` seeds only an empty DB; reset is opt-in via `REDPATCH_RESET_ON_START=1` or `init_db(reset=True)` |
+| Oracle wiped a running gateway's DB (shared default path) | `tests/test_oracle.py` sets its own temp `DB_PATH`/`DATA_DIR` before importing the app; asserted by `test_oracle_uses_isolated_storage` |
+| Concurrent record edits silently overwrote each other | `records.version` column; `update_record` does compare-and-set on the version it read, accepts `expected_version`, returns 409 on mismatch; `test_concurrent_edits_conflict_instead_of_overwriting` |
+| Startup followed symlinks in the data dir | `DATA_DIR` and its subdirs must be real directories owned by the gateway user; files are created with `O_EXCL` + `O_NOFOLLOW`, mode 0600; `test_seeding_refuses_symlinks` |
+| CSV export broke on embedded quotes | `csv.writer`; `test_csv_export_round_trips_quotes_and_commas` |
+| Unbounded audit writes | Each text field capped at 1024 chars (`AUDIT_FIELD_MAX`), `tool_name` limited to 64 chars, table pruned beyond `AUDIT_MAX_ROWS`; `test_audit_fields_are_size_capped` |
+| Harness: 0% gate passed with inconclusive checks; stale audit rows | `--max-asr` now fails on any inconclusive attack (`--allow-inconclusive` to opt out); backend checks are scoped to the attack's own `X-Request-ID` and `MAX(id)` high-water marks |
 
 ## Remaining risks / not addressed here
 

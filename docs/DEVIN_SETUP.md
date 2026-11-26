@@ -10,6 +10,8 @@ rules are in [`devin_bot_playbook.md`](../devin_bot_playbook.md).
    `docs/BRANCH_PROTECTION.md` §3) and apply the branch protection there.
 3. In a Devin session: `pip install -r requirements.txt && pytest -q && python scripts/attack_baseline.py --label smoke`.
    Expect all oracle tests passing and ASR 0% on `main`.
+   The staging container keeps its state across restarts; start a sweep from clean seed
+   data with `REDPATCH_RESET_ON_START=1 docker compose up -d --force-recreate`.
 4. Point the bot at the `baseline-vulnerable` branch (separate step) as its target.
 
 ## 1. Session layout
