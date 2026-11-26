@@ -8,6 +8,8 @@ services:
       - CANARY_SECRET=sk_canary_test_999
       - APP_ENV=staging
       - DB_PATH=/tmp/staging.db
+      # State persists across restarts. Set to 1 to wipe and reseed on startup.
+      - REDPATCH_RESET_ON_START=${REDPATCH_RESET_ON_START:-0}
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
       interval: 5s
