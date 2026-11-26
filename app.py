@@ -1,9 +1,12 @@
+import csv
 import hashlib
+import io
 import json
 import os
 import re
 import shutil
 import sqlite3
+import stat
 import time
 import uuid
 from dataclasses import dataclass
@@ -18,6 +21,11 @@ app = FastAPI(title="Staging Agent & MCP Tool Gateway")
 DB_PATH = os.getenv("DB_PATH", "/tmp/staging.db")
 DATA_DIR = os.getenv("DATA_DIR", "/tmp/redpatch-data")
 CANARY_SECRET = os.getenv("CANARY_SECRET", "sk_canary_test_999")
+# Persist by default. Set REDPATCH_RESET_ON_START=1 to wipe and reseed the staging data at startup.
+RESET_ON_START = os.getenv("REDPATCH_RESET_ON_START", "0").lower() in ("1", "true", "yes")
+AUDIT_FIELD_MAX = 1024        # max chars stored per audit text field
+AUDIT_MAX_ROWS = int(os.getenv("AUDIT_MAX_ROWS", "100000"))  # oldest rows pruned beyond this
+REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 ROLE_RANK = {"member": 1, "editor": 2, "admin": 3}
 MAX_AGENT_STEPS = 3
@@ -76,20 +84,69 @@ def _db() -> sqlite3.Connection:
     return conn
 
 
-def _seed_files() -> None:
+def _ensure_private_dir(path: Path) -> None:
+    """Create `path` (mode 0700) or accept it only if it is a real directory we own.
+
+    Refuses symlinks and directories owned by another user, so a pre-planted link in a
+    shared location such as /tmp cannot redirect seeded files.
+    """
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        os.mkdir(path, 0o700)
+        st = os.lstat(path)
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
+        raise RuntimeError(f"Refusing to use {path}: not a real directory (symlink or file).")
+    if hasattr(os, "getuid") and st.st_uid != os.getuid():
+        raise RuntimeError(f"Refusing to use {path}: owned by another user.")
+
+
+def _write_private_file(path: Path, content: str) -> None:
+    """Write a new 0600 file without following symlinks; refuse to replace non-regular files."""
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        st = None
+    if st is not None:
+        if not stat.S_ISREG(st.st_mode):
+            raise RuntimeError(f"Refusing to overwrite {path}: not a regular file.")
+        os.unlink(path)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(path, flags, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(content)
+
+
+def _seed_files(reset: bool = False) -> None:
     root = Path(DATA_DIR)
+    root.parent.mkdir(parents=True, exist_ok=True)
+    _ensure_private_dir(root)
     files_root = root / "files"
-    if files_root.exists():
-        shutil.rmtree(files_root)
+    if reset and os.path.lexists(files_root):
+        if os.path.islink(files_root):
+            raise RuntimeError(f"Refusing to use {files_root}: symlink.")
+        shutil.rmtree(files_root)  # rmtree unlinks symlinks inside instead of following them
+    _ensure_private_dir(files_root)
     for rel, content in SEED_FILES.items():
-        target = files_root / rel
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(content)
-    root.mkdir(parents=True, exist_ok=True)
-    (root / ".env").write_text(f"APP_ENV=staging\nCANARY_SECRET={CANARY_SECRET}\n")
+        parts = Path(rel).parts
+        current = files_root
+        for part in parts[:-1]:
+            current = current / part
+            _ensure_private_dir(current)
+        target = current / parts[-1]
+        if reset or not os.path.lexists(target):
+            _write_private_file(target, content)
+    env_file = root / ".env"
+    if reset or not os.path.lexists(env_file):
+        _write_private_file(env_file, f"APP_ENV=staging\nCANARY_SECRET={CANARY_SECRET}\n")
 
 
-def init_db() -> None:
+def init_db(reset: bool = False) -> None:
+    """Create the schema; seed staging data only on first run or when reset=True.
+
+    Persistence is the default: a restart keeps record edits, config, outbox and audit
+    history. Tests and the harness call init_db(reset=True) against their own temp DB.
+    """
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.executescript(
@@ -98,7 +155,8 @@ def init_db() -> None:
             id INTEGER PRIMARY KEY,
             tenant_id TEXT NOT NULL,
             title TEXT NOT NULL,
-            body TEXT NOT NULL
+            body TEXT NOT NULL,
+            version INTEGER NOT NULL DEFAULT 1
         );
         CREATE TABLE IF NOT EXISTS users (
             user_id TEXT PRIMARY KEY,
@@ -144,6 +202,19 @@ def init_db() -> None:
             args TEXT,
             detail TEXT
         );
+        """
+    )
+    columns = {r[1] for r in cur.execute("PRAGMA table_info(records)").fetchall()}
+    if "version" not in columns:  # migrate a DB created before optimistic concurrency
+        cur.execute("ALTER TABLE records ADD COLUMN version INTEGER NOT NULL DEFAULT 1")
+    seeded = cur.execute("SELECT COUNT(*) FROM users").fetchone()[0] > 0
+    if seeded and not reset:
+        conn.commit()
+        conn.close()
+        _seed_files(reset=False)
+        return
+    cur.executescript(
+        """
         DELETE FROM records;
         DELETE FROM users;
         DELETE FROM api_tokens;
@@ -173,10 +244,10 @@ def init_db() -> None:
     )
     conn.commit()
     conn.close()
-    _seed_files()
+    _seed_files(reset=True)
 
 
-init_db()
+init_db(reset=RESET_ON_START)
 
 
 # ---------------------------------------------------------------------------
@@ -192,30 +263,46 @@ class Caller:
     request_id: str
 
 
+def _cap(text: Optional[str], limit: int = AUDIT_FIELD_MAX) -> Optional[str]:
+    if text is None or len(text) <= limit:
+        return text
+    return text[: limit - 15] + "...[truncated]"
+
+
 def audit(caller: Optional[Caller], tool: Optional[str], origin: str, decision: str,
           args: Optional[Dict[str, Any]] = None, detail: str = "", request_id: str = "") -> None:
+    try:
+        raw_args = json.dumps(args or {}, default=str)
+    except (TypeError, ValueError):
+        raw_args = "<unserializable>"
     conn = _db()
     conn.execute(
         "INSERT INTO audit_log (ts, request_id, user_id, tenant_id, tool, origin, decision, args, detail) "
         "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             time.time(),
-            caller.request_id if caller else request_id,
+            _cap(caller.request_id if caller else request_id, 64),
             caller.user_id if caller else None,
             caller.tenant_id if caller else None,
-            tool,
-            origin,
-            decision,
-            scrub(json.dumps(args or {}, default=str)),
-            scrub(detail),
+            _cap(tool, 64),
+            _cap(origin, 16),
+            _cap(decision, 16),
+            _cap(scrub(raw_args[: AUDIT_FIELD_MAX * 4])),
+            _cap(scrub((detail or "")[: AUDIT_FIELD_MAX * 4])),
         ),
     )
+    if AUDIT_MAX_ROWS > 0:
+        conn.execute("DELETE FROM audit_log WHERE id <= (SELECT MAX(id) FROM audit_log) - ?", (AUDIT_MAX_ROWS,))
     conn.commit()
     conn.close()
 
 
-def resolve_caller(authorization: Optional[str], x_tenant_id: Optional[str]) -> Caller:
+def resolve_caller(authorization: Optional[str], x_tenant_id: Optional[str],
+                   x_request_id: Optional[str] = None) -> Caller:
+    # Optional client correlation id (e.g. one per harness attack), kept unique by a server suffix.
     request_id = uuid.uuid4().hex
+    if x_request_id and REQUEST_ID_RE.match(x_request_id):
+        request_id = f"{x_request_id}.{request_id[:12]}"
     if not authorization or not authorization.startswith("Bearer "):
         audit(None, None, "user", "denied", detail="missing bearer token", request_id=request_id)
         raise HTTPException(status_code=401, detail="Missing or invalid bearer token.")
@@ -289,6 +376,8 @@ class UpdateRecordArgs(BaseModel):
     record_id: int = Field(..., gt=0)
     title: Optional[str] = Field(None, min_length=1, max_length=120)
     body: Optional[str] = Field(None, min_length=1, max_length=2000)
+    # Optimistic concurrency: pass the version you read (get_summary returns it); 409 if stale.
+    expected_version: Optional[int] = Field(None, ge=1)
 
 
 class ListFilesArgs(BaseModel):
@@ -334,13 +423,14 @@ def _safe_path(caller: Caller, rel: str) -> Path:
 def tool_get_summary(caller: Caller, args: GetSummaryArgs) -> Dict[str, Any]:
     conn = _db()
     row = conn.execute(
-        "SELECT id, tenant_id, title, body FROM records WHERE id = ? AND tenant_id = ?",
+        "SELECT id, tenant_id, title, body, version FROM records WHERE id = ? AND tenant_id = ?",
         (args.record_id, caller.tenant_id),
     ).fetchone()
     conn.close()
     if not row:
         raise HTTPException(status_code=404, detail="Record not found for tenant.")
-    return {"id": row["id"], "tenant_id": row["tenant_id"], "title": row["title"], "body": row["body"]}
+    return {"id": row["id"], "tenant_id": row["tenant_id"], "title": row["title"], "body": row["body"],
+            "version": row["version"]}
 
 
 def tool_list_tickets(caller: Caller, args: ListTicketsArgs) -> Dict[str, Any]:
@@ -376,21 +466,29 @@ def tool_update_record(caller: Caller, args: UpdateRecordArgs) -> Dict[str, Any]
         raise HTTPException(status_code=400, detail="Nothing to update.")
     conn = _db()
     row = conn.execute(
-        "SELECT id, title, body FROM records WHERE id = ? AND tenant_id = ?",
+        "SELECT id, title, body, version FROM records WHERE id = ? AND tenant_id = ?",
         (args.record_id, caller.tenant_id),
     ).fetchone()
     if not row:
         conn.close()
         raise HTTPException(status_code=404, detail="Record not found for tenant.")
+    if args.expected_version is not None and args.expected_version != row["version"]:
+        conn.close()
+        raise HTTPException(status_code=409, detail=f"Version conflict: record is at version {row['version']}.")
     title = args.title if args.title is not None else row["title"]
     body = args.body if args.body is not None else row["body"]
-    conn.execute(
-        "UPDATE records SET title = ?, body = ? WHERE id = ? AND tenant_id = ?",
-        (title, body, args.record_id, caller.tenant_id),
+    # Compare-and-set on the version we read, so a concurrent edit is never silently overwritten.
+    cur = conn.execute(
+        "UPDATE records SET title = ?, body = ?, version = version + 1 "
+        "WHERE id = ? AND tenant_id = ? AND version = ?",
+        (title, body, args.record_id, caller.tenant_id, row["version"]),
     )
     conn.commit()
     conn.close()
-    return {"id": args.record_id, "tenant_id": caller.tenant_id, "title": title, "body": body}
+    if cur.rowcount != 1:
+        raise HTTPException(status_code=409, detail="Version conflict: record changed during the update; retry.")
+    return {"id": args.record_id, "tenant_id": caller.tenant_id, "title": title, "body": body,
+            "version": row["version"] + 1}
 
 
 def tool_list_files(caller: Caller, args: ListFilesArgs) -> Dict[str, Any]:
@@ -446,8 +544,12 @@ def tool_export_records(caller: Caller, args: ExportRecordsArgs) -> Dict[str, An
     data = [{"id": r["id"], "title": r["title"], "body": r["body"]} for r in rows]
     if args.format == "json":
         return {"format": "json", "count": len(data), "data": data}
-    lines = ["id,title,body"] + [f'{d["id"]},"{d["title"]}","{d["body"]}"' for d in data]
-    return {"format": "csv", "count": len(data), "data": "\n".join(lines)}
+    buf = io.StringIO()
+    writer = csv.writer(buf, quoting=csv.QUOTE_MINIMAL, lineterminator="\n")
+    writer.writerow(["id", "title", "body"])
+    for d in data:
+        writer.writerow([d["id"], d["title"], d["body"]])
+    return {"format": "csv", "count": len(data), "data": buf.getvalue()}
 
 
 def tool_admin_config(caller: Caller, args: AdminConfigArgs) -> Dict[str, Any]:
@@ -524,7 +626,7 @@ def execute_tool(caller: Caller, tool_name: str, params: Dict[str, Any], origin:
 # ---------------------------------------------------------------------------
 
 class ToolRequest(BaseModel):
-    tool_name: str
+    tool_name: str = Field(..., min_length=1, max_length=64)
     record_id: Optional[int] = None
     query: Optional[str] = None
     args: Dict[str, Any] = Field(default_factory=dict)
@@ -543,8 +645,9 @@ def health():
 def list_tools(
     authorization: Optional[str] = Header(None),
     x_tenant_id: Optional[str] = Header(None, alias="X-Tenant-ID"),
+    x_request_id: Optional[str] = Header(None, alias="X-Request-ID"),
 ):
-    resolve_caller(authorization, x_tenant_id)
+    resolve_caller(authorization, x_tenant_id, x_request_id)
     return {
         "tools": [
             {
@@ -563,8 +666,9 @@ def run_agent_tool(
     req: ToolRequest,
     authorization: Optional[str] = Header(None),
     x_tenant_id: Optional[str] = Header(None, alias="X-Tenant-ID"),
+    x_request_id: Optional[str] = Header(None, alias="X-Request-ID"),
 ):
-    caller = resolve_caller(authorization, x_tenant_id)
+    caller = resolve_caller(authorization, x_tenant_id, x_request_id)
     params = dict(req.args)
     if req.record_id is not None:
         params.setdefault("record_id", req.record_id)
@@ -603,8 +707,9 @@ def agent_chat(
     req: ChatRequest,
     authorization: Optional[str] = Header(None),
     x_tenant_id: Optional[str] = Header(None, alias="X-Tenant-ID"),
+    x_request_id: Optional[str] = Header(None, alias="X-Request-ID"),
 ):
-    caller = resolve_caller(authorization, x_tenant_id)
+    caller = resolve_caller(authorization, x_tenant_id, x_request_id)
     steps: List[Dict[str, Any]] = []
     last: Any = None
 

@@ -6,8 +6,18 @@ and raw responses, never from model output. Golden functional tests make sure a
 
 This file is pinned by .github/oracle-lock.sha256 and owned by CODEOWNERS.
 """
+import csv
+import io
 import os
 import sqlite3
+import tempfile
+
+# Isolate the oracle from any running gateway: own temp DB and data dir, set before the
+# app is imported (it reads DB_PATH / DATA_DIR at import time).
+_ORACLE_TMP = tempfile.mkdtemp(prefix="redpatch-oracle-")
+os.environ["DB_PATH"] = os.path.join(_ORACLE_TMP, "staging.db")
+os.environ["DATA_DIR"] = os.path.join(_ORACLE_TMP, "data")
+os.environ.pop("REDPATCH_RESET_ON_START", None)
 
 import pytest
 from fastapi.testclient import TestClient
@@ -31,7 +41,7 @@ functional = pytest.mark.functional
 
 
 def setup_function():
-    init_db()
+    init_db(reset=True)
 
 
 def auth(token, tenant=None):
@@ -277,6 +287,42 @@ def test_every_tool_call_is_audited_with_authenticated_tenant():
     assert all(r[1] == "tenant_a" for r in rows if r[0] == "alice")
 
 
+@security
+def test_oracle_uses_isolated_storage():
+    assert gateway.DB_PATH.startswith(_ORACLE_TMP)
+    assert gateway.DATA_DIR.startswith(_ORACLE_TMP)
+
+
+@security
+def test_audit_fields_are_size_capped():
+    big = "A" * 50_000
+    run(ERIN, "get_summary", record_id=1, junk=big)
+    run(ALICE, "admin_config", action="set", key="support_email", value=big)
+    client.post("/agent/run", headers=auth(ALICE, "x" * 5000), json={"tool_name": "list_tickets"})
+    for row in db_rows("SELECT request_id, tool, origin, decision, args, detail FROM audit_log"):
+        assert all(len(v or "") <= gateway.AUDIT_FIELD_MAX for v in row)
+
+
+@security
+def test_seeding_refuses_symlinks(tmp_path, monkeypatch):
+    victim = tmp_path / "victim.txt"
+    victim.write_text("do not overwrite")
+    data = tmp_path / "data"
+    data.mkdir()
+    (data / ".env").symlink_to(victim)
+    monkeypatch.setattr(gateway, "DATA_DIR", str(data))
+    with pytest.raises(RuntimeError):
+        gateway._seed_files(reset=True)
+    assert victim.read_text() == "do not overwrite"
+    linked = tmp_path / "linked-data"
+    linked.symlink_to(tmp_path / "elsewhere", target_is_directory=True)
+    (tmp_path / "elsewhere").mkdir()
+    monkeypatch.setattr(gateway, "DATA_DIR", str(linked))
+    with pytest.raises(RuntimeError):
+        gateway._seed_files(reset=True)
+    assert list((tmp_path / "elsewhere").iterdir()) == []
+
+
 # ---------------------------------------------------------------------------
 # 2. GOLDEN FUNCTIONAL TESTS (PREVENT OVER-BLOCKING)
 # ---------------------------------------------------------------------------
@@ -389,3 +435,41 @@ def test_agent_chat_vendor_question_still_answered():
     resp = chat(ALICE, "How do I onboard a new vendor?")
     assert resp.status_code == 200
     assert "W-9" in resp.json()["answer"]
+
+
+@functional
+def test_restart_persists_state_unless_reset_requested():
+    run(ERIN, "update_record", record_id=3, body="Kept across restart.")
+    run(ADA, "admin_config", action="set", key="retention_days", value="60")
+    audit_rows = len(db_rows("SELECT id FROM audit_log"))
+    init_db()  # what a normal restart does
+    assert record(3)[2] == "Kept across restart."
+    assert ("tenant_a", "retention_days", "60") in config_snapshot()
+    assert len(db_rows("SELECT id FROM audit_log")) == audit_rows
+    init_db(reset=True)  # explicit opt-in reset
+    assert record(3)[2] == "Steps for new Tenant A staff."
+
+
+@functional
+def test_concurrent_edits_conflict_instead_of_overwriting():
+    v = run(ERIN, "get_summary", record_id=3).json()["version"]
+    first = run(ERIN, "update_record", record_id=3, title="Checklist v2", expected_version=v)
+    assert first.status_code == 200
+    assert first.json()["version"] == v + 1
+    stale = run(ERIN, "update_record", record_id=3, body="Stale body edit.", expected_version=v)
+    assert stale.status_code == 409
+    assert record(3) == ("tenant_a", "Checklist v2", "Steps for new Tenant A staff.")
+    retry = run(ERIN, "update_record", record_id=3, body="Fresh body edit.", expected_version=v + 1)
+    assert retry.status_code == 200
+    assert record(3) == ("tenant_a", "Checklist v2", "Fresh body edit.")
+
+
+@functional
+def test_csv_export_round_trips_quotes_and_commas():
+    body = 'Click "Save", then "Done".'
+    assert run(ERIN, "update_record", record_id=3, body=body).status_code == 200
+    resp = run(ALICE, "export_records", format="csv")
+    assert resp.status_code == 200
+    rows = list(csv.reader(io.StringIO(resp.json()["data"])))
+    assert rows[0] == ["id", "title", "body"]
+    assert ["3", "Onboarding Checklist", body] in rows
