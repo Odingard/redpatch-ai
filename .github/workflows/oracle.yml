@@ -1,0 +1,22 @@
+name: Two-Way Verification Oracle
+
+on:
+  pull_request:
+    branches: [ main ]
+  push:
+    branches: [ main ]
+
+jobs:
+  verify-oracle:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Run two-way pytest oracle
+        env:
+          CANARY_SECRET: sk_canary_test_999
+        run: pytest -v tests/test_oracle.py

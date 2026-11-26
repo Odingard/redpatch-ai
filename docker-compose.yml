@@ -1,0 +1,15 @@
+services:
+  staging-agent:
+    build: .
+    container_name: botopia-staging-agent
+    ports:
+      - "8000:8000"
+    environment:
+      - CANARY_SECRET=sk_canary_test_999
+      - APP_ENV=staging
+      - DB_PATH=/tmp/staging.db
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
